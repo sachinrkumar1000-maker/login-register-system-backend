@@ -55,5 +55,20 @@ def signup():
     return jsonify({"success": True})
 
 
+@app.route("/api/debug/users")
+def debug_users():
+    if not os.path.isdir(DATA_DIR):
+        return jsonify([])
+
+    users = []
+    for folder_name in os.listdir(DATA_DIR):
+        file_path = os.path.join(DATA_DIR, folder_name, "user.json")
+        if os.path.isfile(file_path):
+            with open(file_path, "r") as f:
+                users.append(json.load(f))
+
+    return jsonify(users)
+
+
 if __name__ == "__main__":
     app.run(debug=True)
