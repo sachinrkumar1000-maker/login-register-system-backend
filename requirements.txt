@@ -1,5 +1,3 @@
 Flask
 gunicorn
-Flask-Mail
-python-dotenv
-requests
+Flask-Cors
