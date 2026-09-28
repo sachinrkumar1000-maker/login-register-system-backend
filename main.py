@@ -55,6 +55,27 @@ def signup():
     return jsonify({"success": True})
 
 
+@app.route("/api/login", methods=["POST"])
+def login():
+    body = request.get_json(force=True, silent=True) or {}
+    email = body.get("email", "").strip().lower()
+    password = body.get("password", "")
+
+    if not email or not password:
+        return jsonify({"success": False, "field": "general", "message": "Email and password required"}), 400
+
+    if not os.path.isfile(user_file(email)):
+        return jsonify({"success": False, "field": "email", "message": "No user found with this email"}), 404
+
+    with open(user_file(email), "r") as f:
+        user = json.load(f)
+
+    if user.get("password") != password:
+        return jsonify({"success": False, "field": "password", "message": "Incorrect password"}), 401
+
+    return jsonify({"success": True})
+
+
 @app.route("/api/debug/users")
 def debug_users():
     if not os.path.isdir(DATA_DIR):
