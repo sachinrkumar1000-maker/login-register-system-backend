@@ -92,4 +92,5 @@ def debug_users():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("SERVER_PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
