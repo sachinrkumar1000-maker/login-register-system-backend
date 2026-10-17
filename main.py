@@ -132,12 +132,31 @@ def login():
     return jsonify({"success": True})
 
 
+def is_customer(email):
+    # True only if this email is listed in customers.json (see Customers section below)
+    return any(c.get("email") == email for c in read_customers())
+
+
+def customer_required(f):
+    # Use under @login_required on any route only customers may use
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not is_customer(session.get("email", "")):
+            return jsonify({"message": "No active campaigns"}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
+
 @app.route("/api/me")
 def me():
     email = session.get("email")
     if not email:
         return no_store(jsonify({"loggedIn": False})), 401
-    return no_store(jsonify({"loggedIn": True, "email": email}))
+    return no_store(jsonify({
+        "loggedIn": True,
+        "email": email,
+        "isCustomer": is_customer(email),
+    }))
 
 
 @app.route("/api/logout", methods=["POST"])
