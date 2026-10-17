@@ -6,6 +6,7 @@ import json
 import hashlib
 import hmac
 import time
+import threading
 import shutil
 import secrets
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -226,35 +227,106 @@ def admin_logout():
     return jsonify({"success": True})
 
 
-@app.route("/api/admin/users")
-@admin_required
-def admin_users():
-    users = []
-    for folder_name in os.listdir(DATA_DIR):
-        path = os.path.join(DATA_DIR, folder_name, "user.json")
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "r") as f:
-                data = json.load(f)
-            users.append({
-                "email": data.get("email", ""),
-                "created": int(os.path.getmtime(path)),
-            })
-        except (OSError, ValueError):
-            continue
-    users.sort(key=lambda u: u["created"], reverse=True)
-    return no_store(jsonify({"users": users, "count": len(users)}))
+# ---------- Customers (stored in customers.json next to app.py) ----------
+CUSTOMERS_FILE = os.path.join(BASE_DIR, "customers.json")
+_customers_lock = threading.Lock()
+CUSTOMER_STATUSES = ("active", "paused")
 
 
-@app.route("/api/admin/users/delete", methods=["POST"])
+def read_customers():
+    try:
+        with open(CUSTOMERS_FILE, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def write_customers(customers):
+    tmp = CUSTOMERS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(customers, f, indent=2)
+    os.replace(tmp, CUSTOMERS_FILE)
+
+
+def find_customer(customers, email):
+    for c in customers:
+        if c.get("email") == email:
+            return c
+    return None
+
+
+@app.route("/api/admin/customers")
 @admin_required
-def admin_delete_user():
+def admin_customers():
+    customers = sorted(read_customers(), key=lambda c: c.get("added", 0), reverse=True)
+    return no_store(jsonify({"customers": customers, "count": len(customers)}))
+
+
+@app.route("/api/admin/customers/add", methods=["POST"])
+@admin_required
+def admin_add_customer():
     body = request.get_json(force=True, silent=True) or {}
     email = str(body.get("email", "")).strip().lower()
-    if not valid_email(email) or not os.path.isfile(user_file(email)):
-        return jsonify({"success": False, "message": "User not found"}), 404
-    shutil.rmtree(user_folder(email), ignore_errors=True)
+    if not valid_email(email):
+        return jsonify({"success": False, "message": "Enter a valid email address"}), 400
+
+    with _customers_lock:
+        customers = read_customers()
+        if find_customer(customers, email):
+            return jsonify({"success": False, "message": "Customer already exists"}), 409
+        customers.append({
+            "email": email,
+            "added": int(time.time()),
+            "status": "active",
+            "notes": "",
+        })
+        write_customers(customers)
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/customers/detail")
+@admin_required
+def admin_customer_detail():
+    email = request.args.get("email", "").strip().lower()
+    customer = find_customer(read_customers(), email)
+    if not customer:
+        return jsonify({"message": "Customer not found"}), 404
+    return no_store(jsonify({"customer": customer}))
+
+
+@app.route("/api/admin/customers/update", methods=["POST"])
+@admin_required
+def admin_update_customer():
+    body = request.get_json(force=True, silent=True) or {}
+    email = str(body.get("email", "")).strip().lower()
+    status = str(body.get("status", "active"))
+    notes = str(body.get("notes", ""))[:5000]
+    if status not in CUSTOMER_STATUSES:
+        return jsonify({"success": False, "message": "Invalid status"}), 400
+
+    with _customers_lock:
+        customers = read_customers()
+        customer = find_customer(customers, email)
+        if not customer:
+            return jsonify({"success": False, "message": "Customer not found"}), 404
+        customer["status"] = status
+        customer["notes"] = notes
+        write_customers(customers)
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/customers/delete", methods=["POST"])
+@admin_required
+def admin_delete_customer():
+    body = request.get_json(force=True, silent=True) or {}
+    email = str(body.get("email", "")).strip().lower()
+    with _customers_lock:
+        customers = read_customers()
+        remaining = [c for c in customers if c.get("email") != email]
+        if len(remaining) == len(customers):
+            return jsonify({"success": False, "message": "Customer not found"}), 404
+        write_customers(remaining)
     return jsonify({"success": True})
 
 
