@@ -4,6 +4,9 @@ import os
 import re
 import json
 import hashlib
+import hmac
+import time
+import shutil
 import secrets
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -139,6 +142,119 @@ def me():
 @app.route("/api/logout", methods=["POST"])
 def logout():
     session.clear()
+    return jsonify({"success": True})
+
+
+# =====================================================================
+# ADMIN
+# admin.json lives next to app.py ON THE SERVER ONLY (never on Netlify):
+#   {"id": "admin", "password": "your-password"}
+# "password" can also be a werkzeug hash (starts with "scrypt:" or "pbkdf2:").
+# =====================================================================
+ADMIN_FILE = os.path.join(BASE_DIR, "admin.json")
+ADMIN_MAX_FAILS = 5
+ADMIN_LOCK_SECONDS = 300
+_admin_fails = {}  # ip -> (fail_count, first_fail_time)
+
+
+def client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return (fwd.split(",")[0].strip() if fwd else request.remote_addr) or "unknown"
+
+
+def load_admin():
+    try:
+        with open(ADMIN_FILE, "r") as f:
+            data = json.load(f)
+        return str(data.get("id", "")), str(data.get("password", ""))
+    except (OSError, ValueError):
+        return "", ""
+
+
+def admin_password_ok(stored, given):
+    if stored.startswith(("scrypt:", "pbkdf2:")):
+        return check_password_hash(stored, given)
+    return hmac.compare_digest(stored.encode(), given.encode())
+
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin"):
+            return jsonify({"message": "Admin login required"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+
+@app.route("/api/admin/login", methods=["POST"])
+def admin_login():
+    ip = client_ip()
+    count, first = _admin_fails.get(ip, (0, 0))
+    if count and time.time() - first > ADMIN_LOCK_SECONDS:
+        count, first = 0, 0
+    if count >= ADMIN_MAX_FAILS:
+        return jsonify({"success": False, "message": "Too many attempts. Try again in a few minutes."}), 429
+
+    body = request.get_json(force=True, silent=True) or {}
+    admin_id = str(body.get("id", ""))
+    password = str(body.get("password", ""))
+
+    real_id, real_pass = load_admin()
+    id_ok = bool(real_id) and hmac.compare_digest(real_id.encode(), admin_id.encode())
+    pass_ok = bool(real_pass) and admin_password_ok(real_pass, password)
+
+    if not (id_ok and pass_ok):
+        _admin_fails[ip] = (count + 1, first or time.time())
+        return jsonify({"success": False, "message": "Invalid admin ID or password"}), 401
+
+    _admin_fails.pop(ip, None)
+    session.permanent = True
+    session["admin"] = True
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/me")
+def admin_me():
+    if not session.get("admin"):
+        return no_store(jsonify({"admin": False})), 401
+    return no_store(jsonify({"admin": True}))
+
+
+@app.route("/api/admin/logout", methods=["POST"])
+def admin_logout():
+    session.pop("admin", None)
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/users")
+@admin_required
+def admin_users():
+    users = []
+    for folder_name in os.listdir(DATA_DIR):
+        path = os.path.join(DATA_DIR, folder_name, "user.json")
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            users.append({
+                "email": data.get("email", ""),
+                "created": int(os.path.getmtime(path)),
+            })
+        except (OSError, ValueError):
+            continue
+    users.sort(key=lambda u: u["created"], reverse=True)
+    return no_store(jsonify({"users": users, "count": len(users)}))
+
+
+@app.route("/api/admin/users/delete", methods=["POST"])
+@admin_required
+def admin_delete_user():
+    body = request.get_json(force=True, silent=True) or {}
+    email = str(body.get("email", "")).strip().lower()
+    if not valid_email(email) or not os.path.isfile(user_file(email)):
+        return jsonify({"success": False, "message": "User not found"}), 404
+    shutil.rmtree(user_folder(email), ignore_errors=True)
     return jsonify({"success": True})
 
 
