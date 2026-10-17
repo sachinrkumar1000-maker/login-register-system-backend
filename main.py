@@ -5,6 +5,7 @@ import re
 import json
 import hashlib
 import hmac
+import math
 import time
 import threading
 import shutil
@@ -299,6 +300,7 @@ def admin_add_customer():
             "added": int(time.time()),
             "status": "active",
             "notes": "",
+            "campaigns": [],
         })
         write_customers(customers)
     return jsonify({"success": True})
@@ -347,6 +349,142 @@ def admin_delete_customer():
             return jsonify({"success": False, "message": "Customer not found"}), 404
         write_customers(remaining)
     return jsonify({"success": True})
+
+
+# ---------- Campaigns (stored inside each customer in customers.json) ----------
+MIN_VIEWS, MAX_VIEWS = 1000, 99999999
+MIN_DAYS, MAX_DAYS = 1, 365
+MAX_CPM = 1000000
+
+
+def to_int(value):
+    """Whole number or None. Rejects booleans, fractions, NaN/inf, junk."""
+    if isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+        if f != int(f):
+            return None
+        return int(f)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def to_cpm(value):
+    """Non-negative number (max 2 decimals kept) or None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f < 0 or f > MAX_CPM:
+        return None
+    return round(f, 2)
+
+
+def find_campaign(customer, campaign_id):
+    for camp in customer.get("campaigns", []):
+        if camp.get("id") == campaign_id:
+            return camp
+    return None
+
+
+@app.route("/api/admin/campaigns/add", methods=["POST"])
+@admin_required
+def admin_add_campaign():
+    body = request.get_json(force=True, silent=True) or {}
+    email = str(body.get("email", "")).strip().lower()
+    name = str(body.get("name", "")).strip()[:80]
+    total_views = to_int(body.get("total_views"))
+    duration = to_int(body.get("duration_days"))
+
+    if not name:
+        return jsonify({"success": False, "message": "Campaign name is required"}), 400
+    if total_views is None or not (MIN_VIEWS <= total_views <= MAX_VIEWS):
+        return jsonify({"success": False, "message": f"Total views must be between {MIN_VIEWS} and {MAX_VIEWS}"}), 400
+    if duration is None or not (MIN_DAYS <= duration <= MAX_DAYS):
+        return jsonify({"success": False, "message": f"Duration must be between {MIN_DAYS} and {MAX_DAYS} days"}), 400
+
+    with _customers_lock:
+        customers = read_customers()
+        customer = find_customer(customers, email)
+        if not customer:
+            return jsonify({"success": False, "message": "Customer not found"}), 404
+        campaign = {
+            "id": secrets.token_hex(4),
+            "name": name,
+            "total_views": total_views,
+            "duration_days": duration,
+            "views_done": 0,
+            "days_done": 0,
+            "cpm": 0,
+            "created": int(time.time()),
+        }
+        customer.setdefault("campaigns", []).append(campaign)
+        write_customers(customers)
+    return jsonify({"success": True, "id": campaign["id"]})
+
+
+@app.route("/api/admin/campaigns/update", methods=["POST"])
+@admin_required
+def admin_update_campaign():
+    body = request.get_json(force=True, silent=True) or {}
+    email = str(body.get("email", "")).strip().lower()
+    campaign_id = str(body.get("id", ""))
+    views_done = to_int(body.get("views_done"))
+    days_done = to_int(body.get("days_done"))
+    cpm = to_cpm(body.get("cpm"))
+
+    with _customers_lock:
+        customers = read_customers()
+        customer = find_customer(customers, email)
+        camp = find_campaign(customer, campaign_id) if customer else None
+        if not camp:
+            return jsonify({"success": False, "message": "Campaign not found"}), 404
+
+        if views_done is None or not (0 <= views_done <= camp["total_views"]):
+            return jsonify({"success": False, "message": f"Views delivered must be between 0 and {camp['total_views']}"}), 400
+        if days_done is None or not (0 <= days_done <= camp["duration_days"]):
+            return jsonify({"success": False, "message": f"Days completed must be between 0 and {camp['duration_days']}"}), 400
+        if cpm is None:
+            return jsonify({"success": False, "message": "CPM must be a number of 0 or more"}), 400
+
+        camp["views_done"] = views_done
+        camp["days_done"] = days_done
+        camp["cpm"] = cpm
+        write_customers(customers)
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/campaigns/delete", methods=["POST"])
+@admin_required
+def admin_delete_campaign():
+    body = request.get_json(force=True, silent=True) or {}
+    email = str(body.get("email", "")).strip().lower()
+    campaign_id = str(body.get("id", ""))
+
+    with _customers_lock:
+        customers = read_customers()
+        customer = find_customer(customers, email)
+        camps = customer.get("campaigns", []) if customer else []
+        remaining = [c for c in camps if c.get("id") != campaign_id]
+        if not customer or len(remaining) == len(camps):
+            return jsonify({"success": False, "message": "Campaign not found"}), 404
+        customer["campaigns"] = remaining
+        write_customers(customers)
+    return jsonify({"success": True})
+
+
+# What a logged-in customer sees on the home page
+@app.route("/api/campaigns")
+@login_required
+@customer_required
+def my_campaigns():
+    customer = find_customer(read_customers(), session.get("email", ""))
+    campaigns = customer.get("campaigns", []) if customer else []
+    campaigns = sorted(campaigns, key=lambda c: c.get("created", 0), reverse=True)
+    return no_store(jsonify({"campaigns": campaigns}))
 
 
 if __name__ == "__main__":
