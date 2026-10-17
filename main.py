@@ -487,6 +487,149 @@ def my_campaigns():
     return no_store(jsonify({"campaigns": campaigns}))
 
 
+# ---------- Chat (one file per customer: chats/chat-<email>.json) ----------
+CHATS_DIR = os.path.join(BASE_DIR, "chats")
+os.makedirs(CHATS_DIR, exist_ok=True)
+_chat_lock = threading.Lock()
+MAX_CHAT_LEN = 2000
+MAX_CHAT_MESSAGES = 2000
+FILE_SAFE_EMAIL = re.compile(r"^[a-z0-9._%+\-]+@[a-z0-9\-]+(\.[a-z0-9\-]+)*\.[a-z]{2,}$")
+
+
+def chat_path(email):
+    # Normal emails give chat-<email>.json. Anything odd (slashes, "..", very long)
+    # falls back to a hash so an email can never escape the chats folder.
+    if len(email) <= 200 and FILE_SAFE_EMAIL.match(email) and ".." not in email:
+        name = "chat-" + email + ".json"
+    else:
+        name = "chat-" + hashlib.sha256(email.encode()).hexdigest() + ".json"
+    return os.path.join(CHATS_DIR, name)
+
+
+def read_chat(email):
+    chat = {"email": email, "next_id": 1, "customer_read": 0, "admin_read": 0, "messages": []}
+    try:
+        with open(chat_path(email), "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("messages"), list):
+            chat.update(data)
+            if chat["messages"]:
+                chat["next_id"] = max(chat.get("next_id", 1), chat["messages"][-1]["id"] + 1)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return chat
+
+
+def write_chat(email, chat):
+    path = chat_path(email)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(chat, f, indent=2)
+    os.replace(tmp, path)
+
+
+def chat_unread(chat, viewer):
+    other = "admin" if viewer == "customer" else "customer"
+    last = chat.get(viewer + "_read", 0)
+    return sum(1 for m in chat["messages"] if m.get("from") == other and m.get("id", 0) > last)
+
+
+def chat_fetch(email, viewer):
+    after = to_int(request.args.get("after", "0"))
+    if after is None or after < 0:
+        after = 0
+    with _chat_lock:
+        chat = read_chat(email)
+        msgs = [m for m in chat["messages"] if m["id"] > after]
+        if after == 0:
+            msgs = msgs[-300:]
+        latest = chat["messages"][-1]["id"] if chat["messages"] else 0
+        if chat.get(viewer + "_read", 0) < latest:
+            chat[viewer + "_read"] = latest  # the viewer has now seen everything
+            write_chat(email, chat)
+    return no_store(jsonify({"messages": msgs}))
+
+
+def chat_send(email, sender):
+    body = request.get_json(force=True, silent=True) or {}
+    text = str(body.get("text", "")).replace("\r\n", "\n").strip()
+    if not text:
+        return jsonify({"success": False, "message": "Message is empty"}), 400
+    if len(text) > MAX_CHAT_LEN:
+        return jsonify({"success": False, "message": f"Message is too long (max {MAX_CHAT_LEN} characters)"}), 400
+
+    with _chat_lock:
+        chat = read_chat(email)
+        msg = {"id": chat["next_id"], "from": sender, "text": text, "time": int(time.time())}
+        chat["next_id"] = msg["id"] + 1
+        chat["messages"].append(msg)
+        chat["messages"] = chat["messages"][-MAX_CHAT_MESSAGES:]
+        chat[sender + "_read"] = msg["id"]  # sending counts as having read the thread
+        write_chat(email, chat)
+    return jsonify({"success": True, "message": msg})
+
+
+# --- customer side ---
+@app.route("/api/chat")
+@login_required
+@customer_required
+def customer_chat():
+    return chat_fetch(session["email"], "customer")
+
+
+@app.route("/api/chat/unread")
+@login_required
+@customer_required
+def customer_chat_unread():
+    chat = read_chat(session["email"])
+    return no_store(jsonify({"unread": chat_unread(chat, "customer")}))
+
+
+@app.route("/api/chat/send", methods=["POST"])
+@login_required
+@customer_required
+def customer_chat_send():
+    return chat_send(session["email"], "customer")
+
+
+# --- admin side ---
+def admin_chat_email():
+    email = request.args.get("email", "").strip().lower()
+    if not email and request.is_json:
+        email = str((request.get_json(silent=True) or {}).get("email", "")).strip().lower()
+    return email if find_customer(read_customers(), email) else None
+
+
+@app.route("/api/admin/chat")
+@admin_required
+def admin_chat():
+    email = admin_chat_email()
+    if not email:
+        return jsonify({"message": "Customer not found"}), 404
+    return chat_fetch(email, "admin")
+
+
+@app.route("/api/admin/chat/send", methods=["POST"])
+@admin_required
+def admin_chat_send():
+    email = admin_chat_email()
+    if not email:
+        return jsonify({"success": False, "message": "Customer not found"}), 404
+    return chat_send(email, "admin")
+
+
+@app.route("/api/admin/chat/unread")
+@admin_required
+def admin_chat_unread():
+    unread = {}
+    for c in read_customers():
+        email = c.get("email", "")
+        n = chat_unread(read_chat(email), "admin")
+        if n:
+            unread[email] = n
+    return no_store(jsonify({"unread": unread, "total": sum(unread.values())}))
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("SERVER_PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
